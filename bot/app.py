@@ -59,21 +59,18 @@ async def setthumb(message: Message):
     THUMBS[message.from_user.id] = (message.chat.id, source.message_id)
     await message.answer("Thumbnail saved. It will be used for the next /rename job.")
 
+BULKS = {}
+
 @router.message(Command("bulk"))
 async def bulk(message: Message):
     if await reject_if_not_admin(message, CFG.admin_ids):
         return
     args = message.text.split(maxsplit=2)
     if len(args) < 3:
-        await message.answer(
-            "Usage: /bulk PREFIX START\n"
-            "Reply this command to the first file, then send the remaining files together.\n"
-            "Example: /bulk Episode 1"
-        )
+        await message.answer("Usage: /bulk PREFIX START")
         return
-    prefix = args[1]
     try:
-        start = int(args[2])
+        start_number = int(args[2])
     except ValueError:
         await message.answer("START must be a number.")
         return
@@ -81,10 +78,46 @@ async def bulk(message: Message):
     if not source or not source.document:
         await message.answer("Reply /bulk to the first file.")
         return
+    BULKS[message.from_user.id] = {
+        "prefix": args[1], "next": start_number, "messages": [source],
+    }
     await message.answer(
-        "Bulk mode is reserved for the queued multi-file collector. "
-        "Use /rename for a single file."
+        f"Bulk collector started.\nPrefix: {args[1]}\nNext: {start_number}\n\n"
+        "Reply each file with /add. Finish with /bulkdone."
     )
+
+@router.message(Command("add"))
+async def bulk_add(message: Message):
+    if await reject_if_not_admin(message, CFG.admin_ids):
+        return
+    bulk = BULKS.get(message.from_user.id)
+    source = message.reply_to_message
+    if not bulk or not source or not source.document:
+        await message.answer("No active bulk collector.")
+        return
+    bulk["messages"].append(source)
+    await message.answer(f"Added #{len(bulk["messages"])}: {source.document.file_name}")
+
+@router.message(Command("bulkdone"))
+async def bulk_done(message: Message):
+    if await reject_if_not_admin(message, CFG.admin_ids):
+        return
+    bulk = BULKS.pop(message.from_user.id, None)
+    if not bulk:
+        await message.answer("No active bulk collector.")
+        return
+    prefix = bulk["prefix"]
+    start_number = bulk["next"]
+    files = bulk["messages"]
+    for index, source in enumerate(files):
+        original = source.document.file_name
+        ext = "." + original.rsplit(".", 1)[1] if "." in original else ""
+        target = safe_name(f"{prefix} {start_number + index:02d}{ext}")
+        await message.answer(f"Queued {index + 1}/{len(files)}: {target}")
+        # Reuse the exact source message; jobs are created in collection order.
+        job = RenameJob(uuid.uuid4().hex[:12], message.from_user.id, message.chat.id, source.message_id, original, target)
+        JOBS.add(job)
+    await message.answer(f"Bulk sequence queued: {len(files)} files.\nOrder is preserved.")
 
 @router.message(Command("cancel"))
 async def cancel(message: Message):
