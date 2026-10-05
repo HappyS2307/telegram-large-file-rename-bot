@@ -15,6 +15,26 @@ class RenameJob:
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     task: asyncio.Task | None = field(default=None, repr=False)
 
+class BulkCollector:
+    def __init__(self, user_id, prefix, start, timeout=30):
+        self.user_id = user_id
+        self.prefix = prefix
+        self.next_number = start
+        self.timeout = timeout
+        self.messages = []
+        self.task = None
+        self.done = asyncio.Event()
+
+    def add(self, message):
+        self.messages.append(message)
+
+    def stop(self):
+        self.done.set()
+
+    def ordered(self):
+        return list(self.messages)
+
+
 class JobManager:
     def __init__(self, max_concurrent):
         self.jobs = {}
