@@ -33,8 +33,8 @@ def extension(name):
 
 async def do_rename(user_id, chat_id, source_message_id, target_name, cancel_event, status=None):
     source_mt = await USER_CLIENT.get_messages(chat_id, ids=source_message_id)
-    if not source_mt or not source_mt.document:
-        raise RuntimeError("Transfer account cannot access this source file.")
+    if not source_mt or not getattr(source_mt, "media", None):
+        raise RuntimeError("Transfer account cannot access this media file.")
 
     thumb = None
     thumb_ref = THUMBS.get(user_id)
@@ -245,11 +245,11 @@ async def rename(message: Message):
     source = message.reply_to_message
     target = message.text.partition(" ")[2].strip()
     if not source or not target:
-        await message.answer("Reply to a file with /rename NewName.ext")
+        await message.answer("Reply to a video/file with /rename NewName.ext")
         return
-    original = source.document.file_name if source.document else None
-    if not original:
-        await message.answer("Please reply to a Telegram document/file.")
+    original = getattr(getattr(source, "file", None), "name", None)
+    if not original or not getattr(source, "media", None):
+        await message.answer("Please reply to a Telegram video, file, or audio.")
         return
 
     job = RenameJob(
