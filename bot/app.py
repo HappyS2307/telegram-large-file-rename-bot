@@ -31,6 +31,7 @@ async def start(message: Message):
     await message.answer(
         "Large File Rename Bot\n\n"
         "/rename NewName.ext — reply to a file\n"
+        "/bulk PREFIX START — bulk mode\n"
         "/setthumb — reply to a photo\n"
         "/cancel — cancel active job\n"
         "/help — commands"
@@ -57,6 +58,33 @@ async def setthumb(message: Message):
         return
     THUMBS[message.from_user.id] = (message.chat.id, source.message_id)
     await message.answer("Thumbnail saved. It will be used for the next /rename job.")
+
+@router.message(Command("bulk"))
+async def bulk(message: Message):
+    if await reject_if_not_admin(message, CFG.admin_ids):
+        return
+    args = message.text.split(maxsplit=2)
+    if len(args) < 3:
+        await message.answer(
+            "Usage: /bulk PREFIX START\n"
+            "Reply this command to the first file, then send the remaining files together.\n"
+            "Example: /bulk Episode 1"
+        )
+        return
+    prefix = args[1]
+    try:
+        start = int(args[2])
+    except ValueError:
+        await message.answer("START must be a number.")
+        return
+    source = message.reply_to_message
+    if not source or not source.document:
+        await message.answer("Reply /bulk to the first file.")
+        return
+    await message.answer(
+        "Bulk mode is reserved for the queued multi-file collector. "
+        "Use /rename for a single file."
+    )
 
 @router.message(Command("cancel"))
 async def cancel(message: Message):
