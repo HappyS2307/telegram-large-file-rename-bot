@@ -31,7 +31,7 @@ def extension(name):
     return "." + name.rsplit(".", 1)[1] if "." in name else ""
 
 
-async def do_rename(user_id, chat_id, source_message_id, target_name, status=None):
+async def do_rename(user_id, chat_id, source_message_id, target_name, cancel_event, status=None):
     source_mt = await USER_CLIENT.get_messages(chat_id, ids=source_message_id)
     if not source_mt or not source_mt.document:
         raise RuntimeError("Transfer account cannot access this source file.")
@@ -64,18 +64,17 @@ async def do_rename(user_id, chat_id, source_message_id, target_name, status=Non
             pass
 
     return await engine.rename_stream(
-        source_mt, target_name, asyncio.Event(),
+        source_mt, target_name, cancel_event,
         progress_callback=progress, thumb=thumb
     )
 
 
 async def run_job(job, status):
     async def worker():
-        result = await do_rename(
+        await do_rename(
             job.user_id, job.chat_id, job.source_message_id,
-            job.target_name, status
+            job.target_name, job.cancel_event, status
         )
-        await USER_CLIENT.send_message(job.chat_id, result)
         try:
             await BOT.edit_message_text(
                 f"Completed.\nFrom: {job.original_name}\nTo: {job.target_name}",
@@ -92,6 +91,13 @@ async def run_job(job, status):
         except Exception:
             pass
     except Exception as exc:
+        from .transfer import TransferCancelled
+        if isinstance(exc, TransferCancelled) or job.cancelled:
+            try:
+                await BOT.edit_message_text("Cancelled.", job.chat_id, status.message_id)
+            except Exception:
+                pass
+            return
         logging.exception("Job failed: %s", job.job_id)
         try:
             await BOT.edit_message_text(
@@ -113,6 +119,7 @@ async def start(message: Message):
         "/bulkdone — queue bulk files\n"
         "/setthumb — reply to photo\n"
         "/cancel — cancel active jobs\n"
+        "/status — transfer account status\n"
         "/help"
     )
 
@@ -124,6 +131,20 @@ async def help_cmd(message: Message):
         "MTProto streaming rename engine.\n"
         "Files are not stored completely on Railway disk.\n\n"
         "Bulk: /bulk Episode 1, then reply to files with /add, then /bulkdone."
+    )
+
+
+@router.message(Command("status"))
+async def status_cmd(message: Message):
+    if await reject_if_not_admin(message, CFG.admin_ids): return
+    me = await USER_CLIENT.get_me()
+    premium = bool(getattr(me, "premium", False))
+    limit = "4 GB" if premium else "2 GB"
+    await message.answer(
+        f"Transfer account: {'Premium' if premium else 'Free'}\n"
+        f"Telegram upload limit: {limit} per file\n"
+        "Engine: MTProto streaming, 512 KB parts\n"
+        "Railway disk: full file is not buffered"
     )
 
 
@@ -201,9 +222,9 @@ async def bulk_done(message: Message):
 
     await message.answer(f"Bulk queued: {len(jobs)} files. Processing in exact sequence.")
 
-    for job in jobs:
+    for index, job in enumerate(jobs, start=1):
         status = await message.answer(
-            f"Processing {jobs.index(job) + 1}/{len(jobs)}...\n"
+            f"Processing {index}/{len(jobs)}...\n"
             f"{job.original_name} → {job.target_name}"
         )
         await run_job(job, status)
