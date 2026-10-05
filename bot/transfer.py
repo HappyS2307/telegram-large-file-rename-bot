@@ -108,10 +108,14 @@ class TransferEngine:
         self.client = client
 
     async def rename_stream(self, source, target_name, cancel_event, progress_callback=None, thumb=None):
-        if not source or not source.document:
-            raise ValueError("Source message is not a Telegram document/file.")
+        if not source or not getattr(source, "media", None):
+            raise ValueError("Source message does not contain transferable media.")
 
-        size = int(source.file.size or 0)
+        media = source.media
+        if not (source.document or source.video or source.audio):
+            raise ValueError("Source message must be a Telegram video, file, or audio.")
+
+        size = int(getattr(source.file, "size", 0) or 0)
         if size <= 0:
             raise ValueError("Telegram did not provide a valid file size.")
 
