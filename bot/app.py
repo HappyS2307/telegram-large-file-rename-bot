@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import uuid
+from io import BytesIO
 
 from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import Command
@@ -15,6 +16,7 @@ from .transfer import TransferEngine
 
 CFG = load_config()
 JOBS = JobManager(CFG.max_concurrent_jobs)
+THUMBS = {}
 router = Router()
 
 
@@ -29,6 +31,7 @@ async def start(message: Message):
     await message.answer(
         "Large File Rename Bot\n\n"
         "/rename NewName.ext — reply to a file\n"
+        "/setthumb — reply to a photo\n"
         "/cancel — cancel active job\n"
         "/help — commands"
     )
@@ -43,6 +46,17 @@ async def help_cmd(message: Message):
         "Complete files are not stored on Railway disk."
     )
 
+
+@router.message(Command("setthumb"))
+async def setthumb(message: Message):
+    if await reject_if_not_admin(message, CFG.admin_ids):
+        return
+    source = message.reply_to_message
+    if not source or not source.photo:
+        await message.answer("Reply to a photo with /setthumb")
+        return
+    THUMBS[message.from_user.id] = (message.chat.id, source.message_id)
+    await message.answer("Thumbnail saved. It will be used for the next /rename job.")
 
 @router.message(Command("cancel"))
 async def cancel(message: Message):
@@ -91,8 +105,31 @@ async def rename(message: Message):
             raise RuntimeError("Transfer account cannot access this source message.")
 
         engine = TransferEngine(USER_CLIENT)
+        thumb = None
+        thumb_ref = THUMBS.get(message.from_user.id)
+        if thumb_ref:
+            thumb_msg = await USER_CLIENT.get_messages(thumb_ref[0], ids=thumb_ref[1])
+            if thumb_msg and thumb_msg.photo:
+                thumb = BytesIO()
+                await USER_CLIENT.download_media(thumb_msg, file=thumb)
+                thumb.seek(0)
+
+        async def progress(current, total, downloaded):
+            percent = min(100, int(current * 100 / total)) if total else 0
+            filled = int(percent * 12 / 100)
+            bar = "█" * filled + "░" * (12 - filled)
+            try:
+                await BOT.edit_message_text(
+                    f"Transferring...\n[{bar}] {percent}%\n"
+                    f"Downloaded: {downloaded / 1024 / 1024:.1f} MB",
+                    message.chat.id, status.message_id
+                )
+            except Exception:
+                pass
+
         result = await engine.rename_stream(
-            source_mt, job.target_name, job.cancel_event
+            source_mt, job.target_name, job.cancel_event,
+            progress_callback=progress, thumb=thumb
         )
 
         await USER_CLIENT.send_message(message.chat.id, result)
