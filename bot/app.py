@@ -247,8 +247,14 @@ async def rename(message: Message):
     if not source or not target:
         await message.answer("Reply to a video/file with /rename NewName.ext")
         return
-    original = getattr(getattr(source, "file", None), "name", None)
-    if not original or not getattr(source, "media", None):
+    media = source.document or source.video or source.audio
+    original = (
+        getattr(getattr(media, "file_name", None), "strip", lambda: None)()
+        if media else None
+    ) or getattr(getattr(source, "document", None), "file_name", None)
+    if not original:
+        original = "video.mp4" if source.video else "audio.mp3" if source.audio else None
+    if not media:
         await message.answer("Please reply to a Telegram video, file, or audio.")
         return
 
