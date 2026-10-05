@@ -117,7 +117,10 @@ class TransferEngine:
 
         parts = (size + self.PART_SIZE - 1) // self.PART_SIZE
         if parts > 8000:
-            raise ValueError("File exceeds the current 8000-part MTProto upload ceiling.")
+            raise ValueError(
+                "File is too large for the current 8000-part MTProto upload ceiling. "
+                "A 4,000,000,000-byte file needs about 7,630 parts at 512 KB."
+            )
 
         stream = await TelegramStream(
             self.client, source, self.PART_SIZE, cancel_event
@@ -132,6 +135,8 @@ class TransferEngine:
                 await progress_callback(int(current), int(total), stream.stats.downloaded)
 
         try:
+            if cancel_event.is_set():
+                raise TransferCancelled()
             result = await self.client.send_file(
                 source.chat_id,
                 stream,
@@ -142,6 +147,8 @@ class TransferEngine:
                 progress_callback=on_upload,
                 reply_to=source.id,
             )
+            if cancel_event.is_set():
+                raise TransferCancelled()
             if progress_callback:
                 await progress_callback(size, size, stream.stats.downloaded)
             return result
