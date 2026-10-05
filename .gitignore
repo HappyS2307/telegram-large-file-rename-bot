@@ -1,0 +1,10 @@
+.env
+*.session
+*.session-journal
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+tmp/
+*.log
