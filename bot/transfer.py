@@ -107,7 +107,7 @@ class TransferEngine:
     def __init__(self, client: TelegramClient):
         self.client = client
 
-    async def rename_stream(self, source, target_name, cancel_event, progress_callback=None):
+    async def rename_stream(self, source, target_name, cancel_event, progress_callback=None, thumb=None):
         if not source or not source.document:
             raise ValueError("Source message is not a Telegram document/file.")
 
@@ -138,6 +138,7 @@ class TransferEngine:
                 file_size=size,
                 file_name=target_name,
                 force_document=True,
+                thumb=thumb,
                 progress_callback=on_upload,
                 reply_to=source.id,
             )
