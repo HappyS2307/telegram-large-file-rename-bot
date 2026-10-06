@@ -3,13 +3,23 @@ import asyncio
 
 
 @dataclass
+class UserSettings:
+    mode: str = "single"
+    base_name: str | None = None
+    next_name: str | None = None
+    thumbnail_bridge_message_id: int | None = None
+
+
+@dataclass
 class RenameJob:
     job_id: str
     user_id: int
     chat_id: int
     source_message_id: int
+    bridge_message_id: int
     original_name: str
     target_name: str
+    status_message_id: int
     cancelled: bool = False
     status: str = "queued"
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
@@ -18,7 +28,7 @@ class RenameJob:
 
 class JobManager:
     def __init__(self, max_concurrent: int):
-        self.jobs = {}
+        self.jobs: dict[str, RenameJob] = {}
         self._sem = asyncio.Semaphore(max_concurrent)
 
     def add(self, job):
@@ -31,6 +41,12 @@ class JobManager:
         job.cancelled = True
         job.cancel_event.set()
         return True
+
+    def cancel_user(self, user_id):
+        jobs = self.active_for(user_id)
+        for job in jobs:
+            self.cancel(job.job_id)
+        return len(jobs)
 
     def active_for(self, user_id):
         return [
