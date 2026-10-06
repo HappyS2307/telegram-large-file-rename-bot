@@ -256,7 +256,7 @@ async def main():
     global USER_CLIENT
 
     logging.basicConfig(
-        level=getattr(CFG.log_level.upper(), logging.INFO),
+        level=getattr(logging, CFG.log_level.upper(), logging.INFO),
         format="%(asctime)s | %(levelname)s | %(message)s",
     )
 
