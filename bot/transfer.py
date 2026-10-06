@@ -107,7 +107,7 @@ class TransferEngine:
     def __init__(self, client: TelegramClient):
         self.client = client
 
-    async def rename_stream(self, source, target_name, cancel_event, progress_callback=None, thumb=None):
+    async def rename_stream(self, source, target_name, cancel_event, progress_callback=None, thumb=None, destination=None, reply_to=None):
         if not source or not getattr(source, "media", None):
             raise ValueError("Source message does not contain transferable media.")
 
@@ -142,14 +142,14 @@ class TransferEngine:
             if cancel_event.is_set():
                 raise TransferCancelled()
             result = await self.client.send_file(
-                source.chat_id,
+                destination if destination is not None else source.chat_id,
                 stream,
                 file_size=size,
                 file_name=target_name,
                 force_document=True,
                 thumb=thumb,
                 progress_callback=on_upload,
-                reply_to=source.id,
+                reply_to=reply_to,
             )
             if cancel_event.is_set():
                 raise TransferCancelled()
