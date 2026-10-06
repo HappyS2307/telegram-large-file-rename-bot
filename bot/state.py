@@ -8,6 +8,7 @@ class RenameJob:
     chat_id: int
     source_message_id: int
     original_name: str
+    source_username: str | None = None
     target_name: str | None = None
     thumbnail_message_id: int | None = None
     cancelled: bool = False
