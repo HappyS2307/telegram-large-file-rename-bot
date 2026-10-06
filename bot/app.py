@@ -193,6 +193,7 @@ async def process_job(job):
         job.chat_id, job.status_message_id, text, markup
     )
 
+    thumb = None
     try:
         await status(
             f"⏳ Queued\n\n"
@@ -219,15 +220,15 @@ async def process_job(job):
         thumb = await make_thumbnail(job.user_id)
         engine = TransferEngine(USER_CLIENT)
 
-        async def progress(current, total, downloaded):
+        async def progress(phase, current, total, downloaded):
             percent = min(100, int(current * 100 / total)) if total else 0
             filled = int(percent * 20 / 100)
             bar = "█" * filled + "░" * (20 - filled)
+            phase_label = "Downloading" if phase == "download" else "Uploading"
             await status(
-                f"⚙️ Processing\n\n"
+                f"⚙️ {phase_label}\n\n"
                 f"[{bar}] {percent}%\n"
-                f"Upload: {current / 1024 / 1024:.1f} / {total / 1024 / 1024:.1f} MB\n"
-                f"Download: {downloaded / 1024 / 1024:.1f} MB\n"
+                f"{phase_label}: {current / 1024 / 1024:.1f} / {total / 1024 / 1024:.1f} MB\n"
                 f"Output: {job.target_name}",
                 cancel_keyboard(job.job_id),
             )
