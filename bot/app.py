@@ -320,7 +320,7 @@ async def handle_command(message):
     parts = text.split(maxsplit=1)
     command = parts[0].split("@")[0].lower()
 
-    if command in {"/start", "/help"}:
+    if command == "/start":
         st = settings_for(user_id)
         await send_status(
             chat_id,
@@ -334,6 +334,8 @@ async def handle_command(message):
             "4. Send your videos/files",
             keyboard(),
         )
+    elif command == "/help":
+        await send_status(chat_id, await command_help_text(user_id), keyboard())
     elif command == "/setname":
         if len(parts) < 2:
             await send_status(chat_id, "Usage:\n/setname Solo Leveling S03E03.mp4")
@@ -478,6 +480,40 @@ async def poll_bot():
             await asyncio.sleep(3)
 
 
+async def setup_bot_commands():
+    commands = [
+        {"command": "start", "description": "Bot start/menu aur current settings"},
+        {"command": "help", "description": "Commands aur unke functions dekho"},
+        {"command": "setname", "description": "Output filename preset karo"},
+        {"command": "single", "description": "Single mode ON karo"},
+        {"command": "bulk", "description": "Bulk mode + episode auto-numbering ON karo"},
+        {"command": "setthumb", "description": "Reply ki photo ko thumbnail set karo"},
+        {"command": "cancel", "description": "Apne active processing jobs cancel karo"},
+        {"command": "status", "description": "Current mode, filename aur jobs status dekho"},
+    ]
+    await bot_api("setMyCommands", {"commands": commands})
+
+
+async def command_help_text(user_id):
+    st = settings_for(user_id)
+    return (
+        "🎬 Auto Rename Bot — Commands\\n\\n"
+        "/start — Main menu + current settings\\n"
+        "/help — Ye complete command list\\n"
+        "/setname <name> — Output filename preset\\n"
+        "   Example: /setname Solo Leveling S03E03.mp4\\n"
+        "/single — Har file ko same preset name se process karo\\n"
+        "/bulk — First episode se numbering auto-increment karo\\n"
+        "   Example: S03E03 → S03E04 → S03E05\\n"
+        "/setthumb — Photo par reply karke thumbnail set karo\\n"
+        "/cancel — Saare active/queued jobs cancel karo\\n"
+        "/status — Mode, filename, thumbnail aur active jobs\\n\\n"
+        f"Current mode: {st.mode.upper()}\\n"
+        f"Filename: {st.base_name or 'Not set'}\\n"
+        f"Thumbnail: {'Set' if st.thumbnail_bridge_message_id else 'Not set'}"
+    )
+
+
 async def main():
     global USER_CLIENT, HTTP
     logging.basicConfig(
@@ -500,6 +536,7 @@ async def main():
 
     try:
         await bot_api("deleteWebhook", {"drop_pending_updates": False})
+        await setup_bot_commands()
         await asyncio.gather(
             poll_bot(),
             USER_CLIENT.run_until_disconnected(),
