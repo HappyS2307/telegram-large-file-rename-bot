@@ -32,9 +32,35 @@ def extension(name):
 
 
 async def do_rename(user_id, chat_id, source_message_id, target_name, cancel_event, status=None):
+    async def stage(text):
+        if not status:
+            return
+        try:
+            await BOT.edit_message_text(text, chat_id, status.message_id)
+        except Exception:
+            pass
+
+    await stage("Queued.\\nStep 1/3: Reading source message...")
+    logging.info(
+        "Rename job: reading source chat=%s message=%s target=%s",
+        chat_id, source_message_id, target_name
+    )
     source_mt = await USER_CLIENT.get_messages(chat_id, ids=source_message_id)
     if not source_mt or not getattr(source_mt, "media", None):
         raise RuntimeError("Transfer account cannot access this media file.")
+
+    if not (source_mt.document or source_mt.video or source_mt.audio):
+        raise RuntimeError("Source is not a Telegram video, file, or audio.")
+
+    size = int(getattr(source_mt.file, "size", 0) or 0)
+    logging.info(
+        "Rename job: source resolved type=%s size=%s",
+        type(source_mt.media).__name__, size
+    )
+    await stage(
+        f"Queued.\\nStep 2/3: Source ready ({size / 1024 / 1024:.1f} MB).\\n"
+        "Starting transfer..."
+    )
 
     thumb = None
     thumb_ref = THUMBS.get(user_id)
@@ -63,10 +89,13 @@ async def do_rename(user_id, chat_id, source_message_id, target_name, cancel_eve
         except Exception:
             pass
 
-    return await engine.rename_stream(
+    logging.info("Rename job: entering TransferEngine.rename_stream")
+    result = await engine.rename_stream(
         source_mt, target_name, cancel_event,
         progress_callback=progress, thumb=thumb
     )
+    logging.info("Rename job: TransferEngine completed successfully")
+    return result
 
 
 async def run_job(job, status):
