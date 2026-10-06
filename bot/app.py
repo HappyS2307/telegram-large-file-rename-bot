@@ -31,7 +31,7 @@ def extension(name):
     return "." + name.rsplit(".", 1)[1] if "." in name else ""
 
 
-async def do_rename(user_id, chat_id, source_message_id, target_name, cancel_event, status=None):
+async def do_rename(user_id, chat_id, source_message_id, target_name, cancel_event, status=None, source_username=None):
     async def stage(text):
         if not status:
             return
@@ -45,7 +45,25 @@ async def do_rename(user_id, chat_id, source_message_id, target_name, cancel_eve
         "Rename job: reading source chat=%s message=%s target=%s",
         chat_id, source_message_id, target_name
     )
-    source_mt = await USER_CLIENT.get_messages(chat_id, ids=source_message_id)
+    try:
+        source_mt = await USER_CLIENT.get_messages(chat_id, ids=source_message_id)
+    except ValueError as exc:
+        logging.warning("Rename job: MTProto cannot resolve chat=%s: %s", chat_id, exc)
+        source_mt = None
+
+    # Bot API and MTProto are separate sessions. If the transfer account does
+    # not know the private sender entity, use the sender's public username.
+    if not source_mt and source_username:
+        try:
+            entity = await USER_CLIENT.get_entity(source_username)
+            source_mt = await USER_CLIENT.get_messages(entity, ids=source_message_id)
+            logging.info("Rename job: source resolved through username=%s", source_username)
+        except Exception as exc:
+            logging.warning(
+                "Rename job: username fallback failed username=%s: %s",
+                source_username, exc
+            )
+
     if not source_mt or not getattr(source_mt, "media", None):
         raise RuntimeError("Transfer account cannot access this media file.")
 
@@ -102,7 +120,7 @@ async def run_job(job, status):
     async def worker():
         await do_rename(
             job.user_id, job.chat_id, job.source_message_id,
-            job.target_name, job.cancel_event, status
+            job.target_name, job.cancel_event, status, job.source_username
         )
         try:
             await BOT.edit_message_text(
@@ -244,7 +262,7 @@ async def bulk_done(message: Message):
         )
         job = RenameJob(
             uuid.uuid4().hex[:12], message.from_user.id, message.chat.id,
-            source.message_id, original, target
+            source.message_id, original, getattr(source.from_user, "username", None), target
         )
         JOBS.add(job)
         jobs.append(job)
@@ -289,7 +307,7 @@ async def rename(message: Message):
 
     job = RenameJob(
         uuid.uuid4().hex[:12], message.from_user.id, message.chat.id,
-        source.message_id, original, safe_name(target)
+        source.message_id, original, getattr(source.from_user, "username", None), safe_name(target)
     )
     JOBS.add(job)
     status = await message.answer(
