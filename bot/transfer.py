@@ -17,8 +17,14 @@ class TransferStats:
 
 
 class TelegramStream:
-    def __init__(self, client: TelegramClient, source: Message, part_size: int,
-                 cancel_event: asyncio.Event, queue_chunks: int = 4):
+    def __init__(
+        self,
+        client: TelegramClient,
+        source: Message,
+        part_size: int,
+        cancel_event: asyncio.Event,
+        queue_chunks: int = 4,
+    ):
         self.client = client
         self.source = source
         self.part_size = part_size
@@ -27,12 +33,7 @@ class TelegramStream:
         self.buffer = bytearray()
         self.eof = False
         self.producer_task = None
-        self.error = None
         self.stats = TransferStats()
-
-    @property
-    def name(self):
-        return getattr(self.source.file, "name", None) or "file.bin"
 
     async def start(self):
         self.producer_task = asyncio.create_task(self._produce())
@@ -64,14 +65,11 @@ class TelegramStream:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self.error = exc
             with contextlib.suppress(Exception):
                 await self._put(exc)
 
     async def read(self, size=-1):
-        while size < 0 or len(self.buffer) < size:
-            if self.eof:
-                break
+        while (size < 0 or len(self.buffer) < size) and not self.eof:
             item = await self.queue.get()
             if item is None:
                 self.eof = True
@@ -102,33 +100,34 @@ class TelegramStream:
 
 
 class TransferEngine:
-    PART_SIZE = 512 * 1024
-
-    def __init__(self, client: TelegramClient):
+    def __init__(self, client: TelegramClient, part_size_mb: int = 16):
         self.client = client
+        self.part_size = min(512, max(1, part_size_mb)) * 1024 * 1024
 
-    async def rename_stream(self, source, target_name, cancel_event, progress_callback=None, thumb=None, destination=None, reply_to=None):
+    async def rename_stream(
+        self,
+        source,
+        target_name,
+        cancel_event,
+        destination,
+        reply_to=None,
+        progress_callback=None,
+        thumb=None,
+    ):
         if not source or not getattr(source, "media", None):
             raise ValueError("Source message does not contain transferable media.")
 
-        media = source.media
         if not (source.document or source.video or source.audio):
-            raise ValueError("Source message must be a Telegram video, file, or audio.")
+            raise ValueError("Source must be a Telegram video, file, or audio.")
 
         size = int(getattr(source.file, "size", 0) or 0)
         if size <= 0:
             raise ValueError("Telegram did not provide a valid file size.")
 
-        parts = (size + self.PART_SIZE - 1) // self.PART_SIZE
-        if parts > 8000:
-            raise ValueError(
-                "File is too large for the current 8000-part MTProto upload ceiling. "
-                "A 4,000,000,000-byte file needs about 7,630 parts at 512 KB."
-            )
-
         stream = await TelegramStream(
-            self.client, source, self.PART_SIZE, cancel_event
+            self.client, source, self.part_size, cancel_event
         ).start()
+
         last_update = 0.0
 
         async def on_upload(current, total):
@@ -136,13 +135,18 @@ class TransferEngine:
             now = time.monotonic()
             if progress_callback and (now - last_update >= 2 or current >= total):
                 last_update = now
-                await progress_callback(int(current), int(total), stream.stats.downloaded)
+                await progress_callback(
+                    int(current),
+                    int(total),
+                    stream.stats.downloaded,
+                )
 
         try:
             if cancel_event.is_set():
                 raise TransferCancelled()
+
             result = await self.client.send_file(
-                destination if destination is not None else source.chat_id,
+                destination,
                 stream,
                 file_size=size,
                 file_name=target_name,
@@ -151,10 +155,13 @@ class TransferEngine:
                 progress_callback=on_upload,
                 reply_to=reply_to,
             )
+
             if cancel_event.is_set():
                 raise TransferCancelled()
+
             if progress_callback:
                 await progress_callback(size, size, stream.stats.downloaded)
+
             return result
         finally:
             await stream.close()
