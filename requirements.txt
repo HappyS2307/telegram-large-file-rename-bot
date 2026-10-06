@@ -1,3 +1,5 @@
 Telethon>=1.45,<2
 python-dotenv>=1.1,<2
 cryptg>=0.5,<1
+aiohttp>=3.10,<4
+Pillow>=11,<12
