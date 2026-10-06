@@ -21,6 +21,8 @@ BULKS = {}
 router = Router()
 BOT = None
 USER_CLIENT = None
+TRANSFER_USER_ID = None
+BOT_USER_ID = None
 
 
 def safe_name(name):
@@ -45,24 +47,41 @@ async def do_rename(user_id, chat_id, source_message_id, target_name, cancel_eve
         "Rename job: reading source chat=%s message=%s target=%s",
         chat_id, source_message_id, target_name
     )
+    relay_message_id = None
     try:
         source_mt = await USER_CLIENT.get_messages(chat_id, ids=source_message_id)
     except ValueError as exc:
-        logging.warning("Rename job: MTProto cannot resolve chat=%s: %s", chat_id, exc)
+        logging.warning("Rename job: MTProto cannot resolve source chat=%s: %s", chat_id, exc)
         source_mt = None
 
-    # Bot API and MTProto are separate sessions. If the transfer account does
-    # not know the private sender entity, use the sender's public username.
-    if not source_mt and source_username:
+    # Bot API and MTProto are separate sessions. A private Bot API message
+    # does not exist in the MTProto user's chat history. Relay the message
+    # into the transfer account's private chat, then read that copied message
+    # through MTProto. This is server-side; Railway never downloads the file.
+    if not source_mt:
+        if not TRANSFER_USER_ID or not BOT_USER_ID:
+            raise RuntimeError("Transfer relay is not initialized.")
         try:
-            entity = await USER_CLIENT.get_entity(source_username)
-            source_mt = await USER_CLIENT.get_messages(entity, ids=source_message_id)
-            logging.info("Rename job: source resolved through username=%s", source_username)
-        except Exception as exc:
-            logging.warning(
-                "Rename job: username fallback failed username=%s: %s",
-                source_username, exc
+            relay = await BOT.copy_message(
+                chat_id=TRANSFER_USER_ID,
+                from_chat_id=chat_id,
+                message_id=source_message_id,
             )
+            relay_message_id = relay.message_id
+            bot_entity = await USER_CLIENT.get_entity(BOT_USER_ID)
+            source_mt = await USER_CLIENT.get_messages(
+                bot_entity, ids=relay_message_id
+            )
+            logging.info(
+                "Rename job: source relayed to transfer account message=%s",
+                relay_message_id
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Transfer account cannot access the source chat. "
+                "Open the bot once from the MTProto transfer account "
+                "and send /start, then retry."
+            ) from exc
 
     if not source_mt or not getattr(source_mt, "media", None):
         raise RuntimeError("Transfer account cannot access this media file.")
@@ -107,13 +126,37 @@ async def do_rename(user_id, chat_id, source_message_id, target_name, cancel_eve
         except Exception:
             pass
 
+    destination = source_mt.chat_id
+    reply_to = source_mt.id
+    if source_username:
+        try:
+            destination = await USER_CLIENT.get_entity(source_username)
+            reply_to = None
+        except Exception as exc:
+            if relay_message_id:
+                raise RuntimeError(
+                    "Source sender has a username but the transfer account "
+                    "cannot send to that account."
+                ) from exc
+
     logging.info("Rename job: entering TransferEngine.rename_stream")
-    result = await engine.rename_stream(
-        source_mt, target_name, cancel_event,
-        progress_callback=progress, thumb=thumb
-    )
-    logging.info("Rename job: TransferEngine completed successfully")
-    return result
+    try:
+        result = await engine.rename_stream(
+            source_mt, target_name, cancel_event,
+            progress_callback=progress, thumb=thumb,
+            destination=destination, reply_to=reply_to
+        )
+        logging.info("Rename job: TransferEngine completed successfully")
+        return result
+    finally:
+        if relay_message_id:
+            try:
+                await BOT.delete_message(TRANSFER_USER_ID, relay_message_id)
+            except Exception:
+                logging.warning(
+                    "Rename job: failed to remove relay message=%s",
+                    relay_message_id
+                )
 
 
 async def run_job(job, status):
@@ -317,12 +360,14 @@ async def rename(message: Message):
 
 
 async def main():
-    global BOT, USER_CLIENT
+    global BOT, USER_CLIENT, TRANSFER_USER_ID, BOT_USER_ID
     logging.basicConfig(
         level=getattr(logging, CFG.log_level.upper(), logging.INFO),
         format="%(asctime)s | %(levelname)s | %(message)s"
     )
     BOT = Bot(CFG.bot_token)
+    bot_me = await BOT.get_me()
+    BOT_USER_ID = bot_me.id
     USER_CLIENT = TelegramClient(
         StringSession(CFG.user_session_string), CFG.api_id, CFG.api_hash
     )
@@ -331,7 +376,11 @@ async def main():
         raise RuntimeError("USER_SESSION_STRING is invalid or expired.")
 
     me = await USER_CLIENT.get_me()
-    logging.info("MTProto transfer account: id=%s username=%s", me.id, me.username)
+    TRANSFER_USER_ID = me.id
+    logging.info(
+        "MTProto transfer account: id=%s username=%s",
+        me.id, me.username
+    )
 
     dp = Dispatcher()
     dp.include_router(router)
