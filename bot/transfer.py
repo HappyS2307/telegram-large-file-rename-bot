@@ -1,11 +1,13 @@
 import asyncio
 import contextlib
+import os
+import tempfile
 import time
 from dataclasses import dataclass
-from io import BytesIO
 
 from telethon import TelegramClient
 from telethon.tl.custom.message import Message
+from telethon.tl.types import DocumentAttributeFilename
 
 
 class TransferCancelled(Exception):
@@ -15,90 +17,59 @@ class TransferCancelled(Exception):
 @dataclass
 class TransferStats:
     downloaded: int = 0
-
-
-class TelegramStream:
-    # Telegram MTProto file requests are capped at 512 KiB per request.
-    PART_SIZE = 512 * 1024
-
-    def __init__(self, client: TelegramClient, source: Message,
-                 cancel_event: asyncio.Event, queue_chunks: int = 32):
-        self.client = client
-        self.source = source
-        self.cancel_event = cancel_event
-        self.queue = asyncio.Queue(maxsize=queue_chunks)
-        self.buffer = bytearray()
-        self.eof = False
-        self.producer_task = None
-        self.stats = TransferStats()
-
-    async def start(self):
-        self.producer_task = asyncio.create_task(self._produce())
-        return self
-
-    async def _put(self, item):
-        while True:
-            if self.cancel_event.is_set():
-                raise TransferCancelled()
-            try:
-                await asyncio.wait_for(self.queue.put(item), timeout=1)
-                return
-            except asyncio.TimeoutError:
-                continue
-
-    async def _produce(self):
-        try:
-            async for chunk in self.client.iter_download(
-                self.source.media,
-                request_size=self.PART_SIZE,
-                chunk_size=self.PART_SIZE,
-            ):
-                if self.cancel_event.is_set():
-                    raise TransferCancelled()
-                if chunk:
-                    self.stats.downloaded += len(chunk)
-                    await self._put(chunk)
-            await self._put(None)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            with contextlib.suppress(Exception):
-                await self._put(exc)
-
-    async def read(self, size=-1):
-        while (size < 0 or len(self.buffer) < size) and not self.eof:
-            item = await self.queue.get()
-            if item is None:
-                self.eof = True
-                break
-            if isinstance(item, Exception):
-                self.eof = True
-                raise item
-            self.buffer.extend(item)
-            if size < 0:
-                break
-
-        if size < 0:
-            data = bytes(self.buffer)
-            self.buffer.clear()
-        else:
-            data = bytes(self.buffer[:size])
-            del self.buffer[:size]
-
-        if self.cancel_event.is_set():
-            raise TransferCancelled()
-        return data
-
-    async def close(self):
-        if self.producer_task:
-            self.producer_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self.producer_task
+    uploaded: int = 0
 
 
 class TransferEngine:
-    def __init__(self, client: TelegramClient):
+    """Sequential MTProto transfer engine.
+
+    Phase 1: download the complete source message to a temporary file.
+    Phase 2: upload that file to the destination.
+    Only the temporary file path is retained; the full file is never loaded
+    into RAM.
+    """
+
+    PART_SIZE = 512 * 1024
+
+    def __init__(self, client: TelegramClient, temp_dir: str | None = None):
         self.client = client
+        self.temp_dir = temp_dir or tempfile.gettempdir()
+        os.makedirs(self.temp_dir, exist_ok=True)
+
+    async def _download_to_file(self, source: Message, path: str,
+                                size: int, cancel_event: asyncio.Event,
+                                progress_callback=None):
+        downloaded = 0
+        last_update = 0.0
+
+        with open(path, "wb") as fp:
+            async for chunk in self.client.iter_download(
+                source.media,
+                request_size=self.PART_SIZE,
+                chunk_size=self.PART_SIZE,
+            ):
+                if cancel_event.is_set():
+                    raise TransferCancelled()
+                if chunk:
+                    fp.write(chunk)
+                    downloaded += len(chunk)
+
+                    now = time.monotonic()
+                    if progress_callback and (
+                        now - last_update >= 2 or downloaded >= size
+                    ):
+                        last_update = now
+                        await progress_callback(
+                            "download",
+                            downloaded,
+                            size,
+                            downloaded,
+                        )
+
+        if downloaded != size:
+            raise RuntimeError(
+                f"Download size mismatch: expected {size}, got {downloaded}"
+            )
 
     async def rename_stream(
         self,
@@ -112,6 +83,7 @@ class TransferEngine:
     ):
         if not source or not getattr(source, "media", None):
             raise ValueError("Source message does not contain transferable media.")
+
         if not (source.document or source.video or source.audio):
             raise ValueError("Source must be a Telegram video, file, or audio.")
 
@@ -119,51 +91,69 @@ class TransferEngine:
         if size <= 0:
             raise ValueError("Telegram did not provide a valid file size.")
 
-        stream = await TelegramStream(
-            self.client, source, cancel_event
-        ).start()
-
-        last_update = 0.0
-
-        async def on_upload(current, total):
-            nonlocal last_update
-            now = time.monotonic()
-            if progress_callback and (now - last_update >= 2 or current >= total):
-                last_update = now
-                await progress_callback(
-                    int(current), int(total), stream.stats.downloaded
-                )
-
-        # Preserve the original media type and video attributes. This is what
-        # makes an MP4 remain a Telegram video instead of becoming a document.
-        attributes = None
-        if source.video and source.document:
-            attributes = []
-            for attr in source.document.attributes:
-                from telethon.tl.types import DocumentAttributeFilename
-                if isinstance(attr, DocumentAttributeFilename):
-                    attributes.append(DocumentAttributeFilename(file_name=target_name))
-                else:
-                    attributes.append(attr)
+        fd, temp_path = tempfile.mkstemp(
+            prefix="telegram-rename-",
+            suffix=".upload",
+            dir=self.temp_dir,
+        )
+        os.close(fd)
 
         try:
             if cancel_event.is_set():
                 raise TransferCancelled()
 
+            # Phase 1: complete download before upload starts.
+            await self._download_to_file(
+                source,
+                temp_path,
+                size,
+                cancel_event,
+                progress_callback,
+            )
+
+            if cancel_event.is_set():
+                raise TransferCancelled()
+
+            # Phase 2: upload only after the local download is complete.
+            last_update = 0.0
+
+            async def on_upload(current, total):
+                nonlocal last_update
+                if cancel_event.is_set():
+                    raise TransferCancelled()
+
+                now = time.monotonic()
+                if progress_callback and (
+                    now - last_update >= 2 or current >= total
+                ):
+                    last_update = now
+                    await progress_callback(
+                        "upload",
+                        int(current),
+                        int(total),
+                        size,
+                    )
+
+            attributes = None
+            if source.video and source.document:
+                attributes = []
+                for attr in source.document.attributes:
+                    if isinstance(attr, DocumentAttributeFilename):
+                        attributes.append(
+                            DocumentAttributeFilename(file_name=target_name)
+                        )
+                    else:
+                        attributes.append(attr)
+
             result = await self.client.send_file(
                 destination,
-                stream,
+                temp_path,
                 file_size=size,
                 file_name=target_name,
                 force_document=not bool(source.video),
                 mime_type=getattr(source.file, "mime_type", None),
                 attributes=attributes,
-                supports_streaming=bool(
-                    source.video and any(
-                        getattr(a, "supports_streaming", False)
-                        for a in (source.document.attributes if source.document else [])
-                    )
-                ),
+                supports_streaming=bool(source.video),
                 thumb=thumb,
                 progress_callback=on_upload,
                 reply_to=reply_to,
@@ -173,8 +163,9 @@ class TransferEngine:
                 raise TransferCancelled()
 
             if progress_callback:
-                await progress_callback(size, size, stream.stats.downloaded)
+                await progress_callback("done", size, size, size)
 
             return result
         finally:
-            await stream.close()
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(temp_path)
