@@ -3,397 +3,279 @@ import logging
 import uuid
 from io import BytesIO
 
-from aiogram import Bot, Dispatcher, Router
-from aiogram.filters import Command
-from aiogram.types import Message
-from telethon import TelegramClient
+from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
 from .config import load_config
-from .security import reject_if_not_admin
-from .state import JobManager, RenameJob, BulkCollector
-from .transfer import TransferEngine
+from .state import JobManager, RenameJob
+from .transfer import TransferEngine, TransferCancelled
 
 CFG = load_config()
 JOBS = JobManager(CFG.max_concurrent_jobs)
 THUMBS = {}
-BULKS = {}
-router = Router()
-BOT = None
 USER_CLIENT = None
-TRANSFER_USER_ID = None
-BOT_USER_ID = None
 
 
-def safe_name(name):
-    return name.replace("\\", "_").replace("/", "_").strip()[:240] or "renamed_file"
+def safe_name(name: str) -> str:
+    name = (name or "").replace("\\", "_").replace("/", "_")
+    name = " ".join(name.strip().split())
+    return name[:240] or "renamed_file"
 
 
-def extension(name):
-    return "." + name.rsplit(".", 1)[1] if "." in name else ""
+def extension(name: str) -> str:
+    base = (name or "").rsplit("/", 1)[-1]
+    return "." + base.rsplit(".", 1)[1] if "." in base else ""
 
 
-async def do_rename(user_id, chat_id, source_message_id, target_name, cancel_event, status=None, source_username=None):
+def target_from_caption(caption: str, original: str) -> str | None:
+    text = (caption or "").strip()
+    if not text:
+        return None
+    if text.lower().startswith("/rename"):
+        text = text[7:].strip()
+    if not text:
+        return None
+    name = safe_name(text)
+    if not extension(name):
+        name += extension(original)
+    return name
+
+
+def is_media(message):
+    return bool(message and (message.document or message.video or message.audio))
+
+
+def original_name(message):
+    if getattr(message, "file", None):
+        return getattr(message.file, "name", None) or "file.bin"
+    if message.video:
+        return "video.mp4"
+    if message.audio:
+        return "audio.mp3"
+    return "file.bin"
+
+
+async def load_thumbnail(user_id):
+    ref = THUMBS.get(user_id)
+    if not ref:
+        return None
+    msg = await USER_CLIENT.get_messages(ref[0], ids=ref[1])
+    if not msg or not msg.photo:
+        return None
+    thumb = BytesIO()
+    await USER_CLIENT.download_media(msg, file=thumb)
+    thumb.seek(0)
+    return thumb
+
+
+async def process_job(job: RenameJob, status_message):
     async def stage(text):
-        if not status:
-            return
         try:
-            await BOT.edit_message_text(text, chat_id, status.message_id)
+            await status_message.edit(text)
         except Exception:
             pass
 
-    await stage("Queued.\\nStep 1/3: Reading source message...")
-    logging.info(
-        "Rename job: reading source chat=%s message=%s target=%s",
-        chat_id, source_message_id, target_name
-    )
-    relay_message_id = None
-    try:
-        source_mt = await USER_CLIENT.get_messages(chat_id, ids=source_message_id)
-    except ValueError as exc:
-        logging.warning("Rename job: MTProto cannot resolve source chat=%s: %s", chat_id, exc)
-        source_mt = None
-
-    # Bot API and MTProto are separate sessions. A private Bot API message
-    # does not exist in the MTProto user's chat history. Relay the message
-    # into the transfer account's private chat, then read that copied message
-    # through MTProto. This is server-side; Railway never downloads the file.
-    if not source_mt:
-        if not TRANSFER_USER_ID or not BOT_USER_ID:
-            raise RuntimeError("Transfer relay is not initialized.")
-        try:
-            relay = await BOT.copy_message(
-                chat_id=TRANSFER_USER_ID,
-                from_chat_id=chat_id,
-                message_id=source_message_id,
-            )
-            relay_message_id = relay.message_id
-            bot_entity = await USER_CLIENT.get_entity(BOT_USER_ID)
-            source_mt = await USER_CLIENT.get_messages(
-                bot_entity, ids=relay_message_id
-            )
-            logging.info(
-                "Rename job: source relayed to transfer account message=%s",
-                relay_message_id
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                "Transfer account cannot access the source chat. "
-                "Open the bot once from the MTProto transfer account "
-                "and send /start, then retry."
-            ) from exc
-
-    if not source_mt or not getattr(source_mt, "media", None):
-        raise RuntimeError("Transfer account cannot access this media file.")
-
-    if not (source_mt.document or source_mt.video or source_mt.audio):
-        raise RuntimeError("Source is not a Telegram video, file, or audio.")
-
-    size = int(getattr(source_mt.file, "size", 0) or 0)
-    logging.info(
-        "Rename job: source resolved type=%s size=%s",
-        type(source_mt.media).__name__, size
-    )
     await stage(
-        f"Queued.\\nStep 2/3: Source ready ({size / 1024 / 1024:.1f} MB).\\n"
-        "Starting transfer..."
+        f"Queued.\\nSource: {job.original_name}\\nTarget: {job.target_name}\\nStarting..."
     )
 
-    thumb = None
-    thumb_ref = THUMBS.get(user_id)
-    if thumb_ref:
-        thumb_msg = await USER_CLIENT.get_messages(thumb_ref[0], ids=thumb_ref[1])
-        if thumb_msg and thumb_msg.photo:
-            thumb = BytesIO()
-            await USER_CLIENT.download_media(thumb_msg, file=thumb)
-            thumb.seek(0)
+    source = await USER_CLIENT.get_messages(job.chat_id, ids=job.source_message_id)
+    if not source or not is_media(source):
+        raise RuntimeError("Source message no longer contains a transferable file.")
 
-    engine = TransferEngine(USER_CLIENT)
+    size = int(getattr(source.file, "size", 0) or 0)
+    if size <= 0:
+        raise RuntimeError("Telegram did not provide a valid file size.")
+
+    await stage(
+        f"Preparing...\\n{job.original_name}\\nSize: {size / 1024 / 1024:.1f} MB"
+    )
+
+    thumb = await load_thumbnail(job.user_id)
+    engine = TransferEngine(USER_CLIENT, CFG.chunk_size_mb)
 
     async def progress(current, total, downloaded):
-        if not status:
-            return
         percent = min(100, int(current * 100 / total)) if total else 0
-        filled = int(percent * 16 / 100)
-        bar = "█" * filled + "░" * (16 - filled)
-        try:
-            await BOT.edit_message_text(
-                f"Transferring...\n[{bar}] {percent}%\n"
-                f"Upload: {current / 1024 / 1024:.1f} MB / {total / 1024 / 1024:.1f} MB\n"
-                f"Downloaded: {downloaded / 1024 / 1024:.1f} MB",
-                chat_id, status.message_id
-            )
-        except Exception:
-            pass
-
-    # If the source had to be relayed, send the renamed result back to the
-    # Bot API account. Bot API can then copy it to the original user without
-    # requiring the MTProto account to resolve/access that user's entity.
-    if relay_message_id:
-        destination = await USER_CLIENT.get_entity(BOT_USER_ID)
-        reply_to = None
-    else:
-        destination = source_mt.chat_id
-        reply_to = source_mt.id
-
-    logging.info("Rename job: entering TransferEngine.rename_stream")
-    result = await engine.rename_stream(
-        source_mt, target_name, cancel_event,
-        progress_callback=progress, thumb=thumb,
-        destination=destination, reply_to=reply_to
-    )
-    logging.info("Rename job: TransferEngine completed successfully")
-
-    if relay_message_id:
-        try:
-            copied = await BOT.copy_message(
-                chat_id=chat_id,
-                from_chat_id=BOT_USER_ID,
-                message_id=result.id,
-            )
-            logging.info(
-                "Rename job: renamed result copied back to original chat message=%s",
-                copied.message_id
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                "Transfer completed, but the renamed file could not be copied "
-                "back to the original chat."
-            ) from exc
-
-    return result
-
-
-async def run_job(job, status):
-    async def worker():
-        await do_rename(
-            job.user_id, job.chat_id, job.source_message_id,
-            job.target_name, job.cancel_event, status, job.source_username
+        filled = int(percent * 18 / 100)
+        bar = "█" * filled + "░" * (18 - filled)
+        await stage(
+            f"Renaming / Uploading...\\n[{bar}] {percent}%\\n"
+            f"Upload: {current / 1024 / 1024:.1f} / {total / 1024 / 1024:.1f} MB\\n"
+            f"Download: {downloaded / 1024 / 1024:.1f} MB"
         )
-        try:
-            await BOT.edit_message_text(
-                f"Completed.\nFrom: {job.original_name}\nTo: {job.target_name}",
-                job.chat_id, status.message_id
-            )
-        except Exception:
-            pass
 
+    await engine.rename_stream(
+        source=source,
+        target_name=job.target_name,
+        cancel_event=job.cancel_event,
+        destination=job.chat_id,
+        reply_to=job.source_message_id,
+        progress_callback=progress,
+        thumb=thumb,
+    )
+
+    await stage(
+        f"Completed.\\nFrom: {job.original_name}\\nTo: {job.target_name}"
+    )
+
+
+async def run_job(job, status_message):
     try:
-        await JOBS.run(job, worker)
+        await JOBS.run(job, lambda: process_job(job, status_message))
     except asyncio.CancelledError:
         try:
-            await BOT.edit_message_text("Cancelled.", job.chat_id, status.message_id)
+            await status_message.edit("Cancelled.")
+        except Exception:
+            pass
+    except TransferCancelled:
+        try:
+            await status_message.edit("Cancelled.")
         except Exception:
             pass
     except Exception as exc:
-        from .transfer import TransferCancelled
-        if isinstance(exc, TransferCancelled) or job.cancelled:
-            try:
-                await BOT.edit_message_text("Cancelled.", job.chat_id, status.message_id)
-            except Exception:
-                pass
-            return
         logging.exception("Job failed: %s", job.job_id)
         try:
-            await BOT.edit_message_text(
-                f"Failed: {type(exc).__name__}: {exc}",
-                job.chat_id, status.message_id
-            )
+            await status_message.edit(f"Failed: {type(exc).__name__}: {exc}")
         except Exception:
             pass
 
 
-@router.message(Command("start"))
-async def start(message: Message):
-    if await reject_if_not_admin(message, CFG.admin_ids): return
-    await message.answer(
-        "Large File Rename Bot\n\n"
-        "/rename NewName.ext — reply to a file\n"
-        "/bulk PREFIX START — start bulk collector\n"
-        "/add — add replied file\n"
-        "/bulkdone — queue bulk files\n"
-        "/setthumb — reply to photo\n"
-        "/cancel — cancel active jobs\n"
-        "/status — transfer account status\n"
-        "/help"
+def make_job(message, target):
+    return RenameJob(
+        job_id=uuid.uuid4().hex[:12],
+        user_id=message.sender_id,
+        chat_id=message.chat_id,
+        source_message_id=message.id,
+        original_name=original_name(message),
+        target_name=safe_name(target),
     )
 
 
-@router.message(Command("help"))
-async def help_cmd(message: Message):
-    if await reject_if_not_admin(message, CFG.admin_ids): return
-    await message.answer(
-        "MTProto streaming rename engine.\n"
-        "Files are not stored completely on Railway disk.\n\n"
-        "Bulk: /bulk Episode 1, then reply to files with /add, then /bulkdone."
-    )
-
-
-@router.message(Command("status"))
-async def status_cmd(message: Message):
-    if await reject_if_not_admin(message, CFG.admin_ids): return
-    me = await USER_CLIENT.get_me()
-    premium = bool(getattr(me, "premium", False))
-    limit = "4 GB" if premium else "2 GB"
-    await message.answer(
-        f"Transfer account: {'Premium' if premium else 'Free'}\n"
-        f"Telegram upload limit: {limit} per file\n"
-        "Engine: MTProto streaming, 512 KB parts\n"
-        "Railway disk: full file is not buffered"
-    )
-
-
-@router.message(Command("setthumb"))
-async def setthumb(message: Message):
-    if await reject_if_not_admin(message, CFG.admin_ids): return
-    source = message.reply_to_message
-    if not source or not source.photo:
-        await message.answer("Reply to a photo with /setthumb")
-        return
-    THUMBS[message.from_user.id] = (message.chat.id, source.message_id)
-    await message.answer("Thumbnail saved.")
-
-
-@router.message(Command("bulk"))
-async def bulk(message: Message):
-    if await reject_if_not_admin(message, CFG.admin_ids): return
-    args = message.text.split(maxsplit=2)
-    if len(args) < 3:
-        await message.answer("Usage: /bulk PREFIX START")
-        return
-    try:
-        start = int(args[2])
-    except ValueError:
-        await message.answer("START must be a number.")
-        return
-    source = message.reply_to_message
-    if not source or not source.document:
-        await message.answer("Reply /bulk to the first file.")
-        return
-    BULKS[message.from_user.id] = BulkCollector(
-        message.from_user.id, args[1], start
-    )
-    BULKS[message.from_user.id].add(source)
-    await message.answer(
-        f"Bulk collector started. Prefix: {args[1]} | Next: {start}\n"
-        "Reply each additional file with /add. Finish with /bulkdone."
-    )
-
-
-@router.message(Command("add"))
-async def bulk_add(message: Message):
-    if await reject_if_not_admin(message, CFG.admin_ids): return
-    collector = BULKS.get(message.from_user.id)
-    source = message.reply_to_message
-    if not collector or not source or not source.document:
-        await message.answer("No active bulk collector.")
-        return
-    collector.add(source)
-    await message.answer(f"Added #{len(collector.messages)}: {source.document.file_name}")
-
-
-@router.message(Command("bulkdone"))
-async def bulk_done(message: Message):
-    if await reject_if_not_admin(message, CFG.admin_ids): return
-    collector = BULKS.pop(message.from_user.id, None)
-    if not collector:
-        await message.answer("No active bulk collector.")
-        return
-
-    jobs = []
-    for index, source in enumerate(collector.ordered()):
-        if not source or not source.document:
-            continue
-        original = source.document.file_name
-        target = safe_name(
-            f"{collector.prefix} {collector.next_number + index:02d}{extension(original)}"
-        )
-        job = RenameJob(
-            uuid.uuid4().hex[:12], message.from_user.id, message.chat.id,
-            source.message_id, original, getattr(source.from_user, "username", None), target
-        )
-        JOBS.add(job)
-        jobs.append(job)
-
-    await message.answer(f"Bulk queued: {len(jobs)} files. Processing in exact sequence.")
-
-    for index, job in enumerate(jobs, start=1):
-        status = await message.answer(
-            f"Processing {index}/{len(jobs)}...\n"
-            f"{job.original_name} → {job.target_name}"
-        )
-        await run_job(job, status)
-
-
-@router.message(Command("cancel"))
-async def cancel(message: Message):
-    if await reject_if_not_admin(message, CFG.admin_ids): return
-    jobs = JOBS.active_for(message.from_user.id)
-    for job in jobs:
-        JOBS.cancel(job.job_id)
-    await message.answer("Cancellation requested." if jobs else "No active job.")
-
-
-@router.message(Command("rename"))
-async def rename(message: Message):
-    if await reject_if_not_admin(message, CFG.admin_ids): return
-    source = message.reply_to_message
-    target = message.text.partition(" ")[2].strip()
-    if not source or not target:
-        await message.answer("Reply to a video/file with /rename NewName.ext")
-        return
-    media = source.document or source.video or source.audio
-    original = (
-        getattr(getattr(media, "file_name", None), "strip", lambda: None)()
-        if media else None
-    ) or getattr(getattr(source, "document", None), "file_name", None)
-    if not original:
-        original = "video.mp4" if source.video else "audio.mp3" if source.audio else None
-    if not media:
-        await message.answer("Please reply to a Telegram video, file, or audio.")
-        return
-
-    job = RenameJob(
-        uuid.uuid4().hex[:12], message.from_user.id, message.chat.id,
-        source.message_id, original, getattr(source.from_user, "username", None), safe_name(target)
-    )
+async def queue_job(source, target, status=None):
+    job = make_job(source, target)
     JOBS.add(job)
-    status = await message.answer(
-        f"Queued.\nFrom: {original}\nTo: {job.target_name}\nStarting..."
-    )
+    if status is None:
+        status = await source.reply(
+            f"Queued.\\nFrom: {job.original_name}\\nTo: {job.target_name}"
+        )
     job.task = asyncio.create_task(run_job(job, status))
+    return job
+
+
+async def handle_command(event):
+    text = (event.raw_text or "").strip()
+    lower = text.lower()
+
+    if lower in {"/start", "/help"}:
+        await event.reply(
+            "Auto Rename is ON.\\n\\n"
+            "Send a video/file/audio with the desired filename as its caption.\\n"
+            "Example: My Anime S01E01.mp4\\n\\n"
+            "Or reply to a file with /rename NewName.ext\\n"
+            "/setthumb — reply to a photo\\n"
+            "/cancel — cancel your active jobs\\n"
+            "/status — engine status"
+        )
+        return True
+
+    if lower == "/status":
+        me = await USER_CLIENT.get_me()
+        await event.reply(
+            "Auto Rename: ON\\n"
+            f"Transfer account: {me.first_name or ''}\\n"
+            f"Premium: {'Yes' if getattr(me, 'premium', False) else 'No'}\\n"
+            f"Engine: MTProto streaming, {CFG.chunk_size_mb} MB chunks\\n"
+            "Railway disk: no full-file buffering\\n"
+            f"Active jobs: {len(JOBS.active_for(event.sender_id))}"
+        )
+        return True
+
+    if lower == "/cancel":
+        jobs = JOBS.active_for(event.sender_id)
+        for job in jobs:
+            JOBS.cancel(job.job_id)
+        await event.reply(
+            f"Cancellation requested for {len(jobs)} job(s)." if jobs else "No active job."
+        )
+        return True
+
+    if lower.startswith("/setthumb"):
+        source = await event.get_reply_message()
+        if not source or not source.photo:
+            await event.reply("Reply to a photo with /setthumb")
+        else:
+            THUMBS[event.sender_id] = (source.chat_id, source.id)
+            await event.reply("Thumbnail saved for auto-renaming.")
+        return True
+
+    if lower.startswith("/rename"):
+        source = await event.get_reply_message()
+        target = text[7:].strip()
+        if not source or not target or not is_media(source):
+            await event.reply("Reply to a video/file/audio with /rename NewName.ext")
+            return True
+        status = await event.reply("Queued...")
+        job = await queue_job(source, safe_name(target), status)
+        logging.info("Manual rename queued job=%s", job.job_id)
+        return True
+
+    return False
+
+
+async def incoming_handler(event):
+    if event.sender_id not in CFG.admin_ids:
+        return
+
+    message = event.message
+    text = (event.raw_text or "").strip()
+
+    if text.startswith("/"):
+        await handle_command(event)
+        return
+
+    if not is_media(message):
+        return
+
+    original = original_name(message)
+    target = target_from_caption(text, original)
+    if not target:
+        await event.reply(
+            "File received. Add the desired filename as the caption and resend.\\n"
+            f"Example: {original}"
+        )
+        return
+
+    logging.info(
+        "Auto rename received chat=%s message=%s from=%s: %s -> %s",
+        message.chat_id, message.id, event.sender_id, original, target
+    )
+    await queue_job(message, target)
 
 
 async def main():
-    global BOT, USER_CLIENT, TRANSFER_USER_ID, BOT_USER_ID
+    global USER_CLIENT
+
     logging.basicConfig(
-        level=getattr(logging, CFG.log_level.upper(), logging.INFO),
-        format="%(asctime)s | %(levelname)s | %(message)s"
+        level=getattr(CFG.log_level.upper(), logging.INFO),
+        format="%(asctime)s | %(levelname)s | %(message)s",
     )
-    BOT = Bot(CFG.bot_token)
-    bot_me = await BOT.get_me()
-    BOT_USER_ID = bot_me.id
+
     USER_CLIENT = TelegramClient(
         StringSession(CFG.user_session_string), CFG.api_id, CFG.api_hash
     )
     await USER_CLIENT.connect()
+
     if not await USER_CLIENT.is_user_authorized():
         raise RuntimeError("USER_SESSION_STRING is invalid or expired.")
 
     me = await USER_CLIENT.get_me()
-    TRANSFER_USER_ID = me.id
-    logging.info(
-        "MTProto transfer account: id=%s username=%s",
-        me.id, me.username
-    )
+    logging.info("Auto Rename account: id=%s username=%s", me.id, me.username)
+    logging.info("Auto Rename is ready; waiting for admin media")
 
-    dp = Dispatcher()
-    dp.include_router(router)
-    try:
-        await dp.start_polling(BOT)
-    finally:
-        await USER_CLIENT.disconnect()
-        await BOT.session.close()
+    USER_CLIENT.add_event_handler(
+        incoming_handler, events.NewMessage(incoming=True)
+    )
+    await USER_CLIENT.run_until_disconnected()
 
 
 if __name__ == "__main__":
