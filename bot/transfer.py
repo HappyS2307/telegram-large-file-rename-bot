@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import time
 from dataclasses import dataclass
+from io import BytesIO
 
 from telethon import TelegramClient
 from telethon.tl.custom.message import Message
@@ -17,17 +18,13 @@ class TransferStats:
 
 
 class TelegramStream:
-    def __init__(
-        self,
-        client: TelegramClient,
-        source: Message,
-        part_size: int,
-        cancel_event: asyncio.Event,
-        queue_chunks: int = 4,
-    ):
+    # Telegram MTProto file requests are capped at 512 KiB per request.
+    PART_SIZE = 512 * 1024
+
+    def __init__(self, client: TelegramClient, source: Message,
+                 cancel_event: asyncio.Event, queue_chunks: int = 32):
         self.client = client
         self.source = source
-        self.part_size = part_size
         self.cancel_event = cancel_event
         self.queue = asyncio.Queue(maxsize=queue_chunks)
         self.buffer = bytearray()
@@ -53,8 +50,8 @@ class TelegramStream:
         try:
             async for chunk in self.client.iter_download(
                 self.source.media,
-                request_size=self.part_size,
-                chunk_size=self.part_size,
+                request_size=self.PART_SIZE,
+                chunk_size=self.PART_SIZE,
             ):
                 if self.cancel_event.is_set():
                     raise TransferCancelled()
@@ -100,9 +97,8 @@ class TelegramStream:
 
 
 class TransferEngine:
-    def __init__(self, client: TelegramClient, part_size_mb: int = 16):
+    def __init__(self, client: TelegramClient):
         self.client = client
-        self.part_size = min(512, max(1, part_size_mb)) * 1024 * 1024
 
     async def rename_stream(
         self,
@@ -116,7 +112,6 @@ class TransferEngine:
     ):
         if not source or not getattr(source, "media", None):
             raise ValueError("Source message does not contain transferable media.")
-
         if not (source.document or source.video or source.audio):
             raise ValueError("Source must be a Telegram video, file, or audio.")
 
@@ -125,7 +120,7 @@ class TransferEngine:
             raise ValueError("Telegram did not provide a valid file size.")
 
         stream = await TelegramStream(
-            self.client, source, self.part_size, cancel_event
+            self.client, source, cancel_event
         ).start()
 
         last_update = 0.0
@@ -136,10 +131,20 @@ class TransferEngine:
             if progress_callback and (now - last_update >= 2 or current >= total):
                 last_update = now
                 await progress_callback(
-                    int(current),
-                    int(total),
-                    stream.stats.downloaded,
+                    int(current), int(total), stream.stats.downloaded
                 )
+
+        # Preserve the original media type and video attributes. This is what
+        # makes an MP4 remain a Telegram video instead of becoming a document.
+        attributes = None
+        if source.video and source.document:
+            attributes = []
+            for attr in source.document.attributes:
+                from telethon.tl.types import DocumentAttributeFilename
+                if isinstance(attr, DocumentAttributeFilename):
+                    attributes.append(DocumentAttributeFilename(file_name=target_name))
+                else:
+                    attributes.append(attr)
 
         try:
             if cancel_event.is_set():
@@ -150,7 +155,15 @@ class TransferEngine:
                 stream,
                 file_size=size,
                 file_name=target_name,
-                force_document=True,
+                force_document=not bool(source.video),
+                mime_type=getattr(source.file, "mime_type", None),
+                attributes=attributes,
+                supports_streaming=bool(
+                    source.video and any(
+                        getattr(a, "supports_streaming", False)
+                        for a in (source.document.attributes if source.document else [])
+                    )
+                ),
                 thumb=thumb,
                 progress_callback=on_upload,
                 reply_to=reply_to,
