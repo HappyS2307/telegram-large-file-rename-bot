@@ -126,37 +126,42 @@ async def do_rename(user_id, chat_id, source_message_id, target_name, cancel_eve
         except Exception:
             pass
 
-    destination = source_mt.chat_id
-    reply_to = source_mt.id
-    if source_username:
-        try:
-            destination = await USER_CLIENT.get_entity(source_username)
-            reply_to = None
-        except Exception as exc:
-            if relay_message_id:
-                raise RuntimeError(
-                    "Source sender has a username but the transfer account "
-                    "cannot send to that account."
-                ) from exc
+    # If the source had to be relayed, send the renamed result back to the
+    # Bot API account. Bot API can then copy it to the original user without
+    # requiring the MTProto account to resolve/access that user's entity.
+    if relay_message_id:
+        destination = await USER_CLIENT.get_entity(BOT_USER_ID)
+        reply_to = None
+    else:
+        destination = source_mt.chat_id
+        reply_to = source_mt.id
 
     logging.info("Rename job: entering TransferEngine.rename_stream")
-    try:
-        result = await engine.rename_stream(
-            source_mt, target_name, cancel_event,
-            progress_callback=progress, thumb=thumb,
-            destination=destination, reply_to=reply_to
-        )
-        logging.info("Rename job: TransferEngine completed successfully")
-        return result
-    finally:
-        if relay_message_id:
-            try:
-                await BOT.delete_message(TRANSFER_USER_ID, relay_message_id)
-            except Exception:
-                logging.warning(
-                    "Rename job: failed to remove relay message=%s",
-                    relay_message_id
-                )
+    result = await engine.rename_stream(
+        source_mt, target_name, cancel_event,
+        progress_callback=progress, thumb=thumb,
+        destination=destination, reply_to=reply_to
+    )
+    logging.info("Rename job: TransferEngine completed successfully")
+
+    if relay_message_id:
+        try:
+            copied = await BOT.copy_message(
+                chat_id=chat_id,
+                from_chat_id=BOT_USER_ID,
+                message_id=result.id,
+            )
+            logging.info(
+                "Rename job: renamed result copied back to original chat message=%s",
+                copied.message_id
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Transfer completed, but the renamed file could not be copied "
+                "back to the original chat."
+            ) from exc
+
+    return result
 
 
 async def run_job(job, status):
